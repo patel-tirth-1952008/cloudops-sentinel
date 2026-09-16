@@ -2,15 +2,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
 /* ------------------------------------------------------------------ */
-/*  Types                                                              */
+/* Types                                                               */
 /* ------------------------------------------------------------------ */
 
-type ServiceStatus = 'healthy' | 'degraded' | 'down';
+type ServiceStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
 type Severity = 'critical' | 'warning' | 'info';
 type IncidentStatus = 'active' | 'resolved';
-type SeverityFilter = 'all' | Severity;
-type StatusFilter = 'all' | IncidentStatus;
+type MetricKey = 'latency' | 'errorRate' | 'cpu';
 
 interface Service {
   id: string;
@@ -19,10 +20,9 @@ interface Service {
   status: ServiceStatus;
   uptime: number;
   responseTime: number;
+  latencyHistory: number[];
   checkInterval: number;
   latencyThreshold: number;
-  lastChecked: string;
-  sparkline: number[];
 }
 
 interface Incident {
@@ -39,23 +39,18 @@ interface Incident {
 
 interface MetricPoint {
   timestamp: string;
-  latency: number;
-  errorRate: number;
-  cpu: number;
+  value: number;
 }
 
-interface HealthInfo {
-  status: string;
-  database: string;
-  uptime: string;
-  version: string;
+interface MetricsResponse {
+  serviceId: string;
+  latency: MetricPoint[];
+  errorRate: MetricPoint[];
+  cpu: MetricPoint[];
 }
 
 interface Summary {
   total: number;
-  healthy: number;
-  degraded: number;
-  down: number;
   uptime: number;
   activeIncidents: number;
   avgP95: number;
@@ -76,142 +71,125 @@ interface FormErrors {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Constants & helpers                                                */
+/* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+function normalizeStatus(raw: unknown): ServiceStatus {
+  const s = String(raw ?? '').toLowerCase();
+  if (s.includes('down') || s.includes('error') || s.includes('fail') || s.includes('crit')) return 'down';
+  if (s.includes('degrad') || s.includes('warn') || s.includes('slow')) return 'degraded';
+  if (s.includes('health') || s.includes('ok') || s.includes('up') || s.includes('pass')) return 'healthy';
+  return 'unknown';
+}
 
-const SEVERITY_META: Record<Severity, { label: string; dot: string; badge: string; ring: string }> = {
-  critical: {
-    label: 'Critical',
-    dot: 'bg-rose-500',
-    badge: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
-    ring: 'ring-rose-500/40',
-  },
-  warning: {
-    label: 'Warning',
-    dot: 'bg-amber-400',
-    badge: 'bg-amber-400/15 text-amber-300 border-amber-400/30',
-    ring: 'ring-amber-400/40',
-  },
-  info: {
-    label: 'Info',
-    dot: 'bg-cyan-400',
-    badge: 'bg-cyan-400/15 text-cyan-300 border-cyan-400/30',
-    ring: 'ring-cyan-400/40',
-  },
-};
+function normalizeSeverity(raw: unknown): Severity {
+  const s = String(raw ?? '').toLowerCase();
+  if (s.includes('crit')) return 'critical';
+  if (s.includes('warn')) return 'warning';
+  return 'info';
+}
 
-const STATUS_META: Record<ServiceStatus, { label: string; dot: string; text: string; ring: string; soft: string }> = {
-  healthy: {
-    label: 'Operational',
-    dot: 'bg-emerald-400',
-    text: 'text-emerald-300',
-    ring: 'ring-emerald-400/40',
-    soft: 'bg-emerald-400/10',
-  },
-  degraded: {
-    label: 'Degraded',
-    dot: 'bg-amber-400',
-    text: 'text-amber-300',
-    ring: 'ring-amber-400/40',
-    soft: 'bg-amber-400/10',
-  },
-  down: {
-    label: 'Down',
-    dot: 'bg-rose-500',
-    text: 'text-rose-300',
-    ring: 'ring-rose-500/40',
-    soft: 'bg-rose-500/10',
-  },
-};
+function normalizeIncidentStatus(raw: unknown): IncidentStatus {
+  const s = String(raw ?? '').toLowerCase();
+  if (s.includes('resolv') || s.includes('closed') || s.includes('ack')) return 'resolved';
+  return 'active';
+}
 
-function formatUptime(seconds: number): string {
-  if (!isFinite(seconds) || seconds < 0) return '—';
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (d > 0) return `${d}d ${h}h ${m}m`;
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
+function toNumber(v: unknown, fallback = 0): number {
+  const n = typeof v === 'number' ? v : parseFloat(String(v));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function toHistory(v: unknown): number[] {
+  if (Array.isArray(v)) return v.map((x) => toNumber(x, 0));
+  return [];
+}
+
+function mapService(raw: any): Service {
+  const id = String(raw?.id ?? raw?._id ?? raw?.serviceId ?? Math.random().toString(36).slice(2));
+  const name = String(raw?.name ?? raw?.serviceName ?? 'Unnamed Service');
+  const url = String(raw?.url ?? raw?.healthcheckUrl ?? raw?.endpoint ?? '');
+  const status = normalizeStatus(raw?.status ?? raw?.state ?? raw?.health);
+  const uptime = toNumber(raw?.uptime ?? raw?.uptimePercent ?? raw?.uptime_pct, 100);
+  const responseTime = toNumber(raw?.responseTime ?? raw?.response_time ?? raw?.latency ?? raw?.avgLatency, 0);
+  const latencyHistory = toHistory(raw?.latencyHistory ?? raw?.latency_history ?? raw?.history ?? raw?.sparkline);
+  const checkInterval = toNumber(raw?.checkInterval ?? raw?.check_interval ?? raw?.interval, 30);
+  const latencyThreshold = toNumber(raw?.latencyThreshold ?? raw?.latency_threshold ?? raw?.threshold, 500);
+  return { id, name, url, status, uptime, responseTime, latencyHistory, checkInterval, latencyThreshold };
+}
+
+function mapIncident(raw: any): Incident {
+  const id = String(raw?.id ?? raw?._id ?? raw?.incidentId ?? Math.random().toString(36).slice(2));
+  const serviceId = String(raw?.serviceId ?? raw?.service_id ?? '');
+  const serviceName = String(raw?.serviceName ?? raw?.service_name ?? raw?.service ?? 'Unknown Service');
+  const severity = normalizeSeverity(raw?.severity ?? raw?.level);
+  const status = normalizeIncidentStatus(raw?.status ?? raw?.state);
+  const title = String(raw?.title ?? raw?.name ?? raw?.summary ?? 'Incident');
+  const description = String(raw?.description ?? raw?.message ?? raw?.details ?? '');
+  const createdAt = String(raw?.createdAt ?? raw?.created_at ?? raw?.timestamp ?? new Date().toISOString());
+  const resolvedAt = raw?.resolvedAt ?? raw?.resolved_at ?? null;
+  return { id, serviceId, serviceName, severity, status, title, description, createdAt, resolvedAt: resolvedAt ? String(resolvedAt) : null };
+}
+
+function mapMetrics(raw: any): MetricsResponse {
+  const pick = (arr: unknown): MetricPoint[] =>
+    Array.isArray(arr)
+      ? arr.map((p: any) => ({
+          timestamp: String(p?.timestamp ?? p?.time ?? p?.t ?? ''),
+          value: toNumber(p?.value ?? p?.v ?? p, 0),
+        }))
+      : [];
+  return {
+    serviceId: String(raw?.serviceId ?? raw?.service_id ?? ''),
+    latency: pick(raw?.latency ?? raw?.latencySeries ?? raw?.latency_series),
+    errorRate: pick(raw?.errorRate ?? raw?.error_rate ?? raw?.errors),
+    cpu: pick(raw?.cpu ?? raw?.cpuUsage ?? raw?.cpu_usage),
+  };
+}
+
+function extractArray(data: any): any[] {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.services)) return data.services;
+  if (Array.isArray(data?.incidents)) return data.incidents;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.results)) return data.results;
+  return [];
 }
 
 function timeAgo(iso: string): string {
-  if (!iso) return '—';
-  const t = new Date(iso).getTime();
-  if (isNaN(t)) return '—';
-  const diff = Math.max(0, Date.now() - t);
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '—';
+  const diff = Date.now() - then;
   const s = Math.floor(diff / 1000);
-  if (s < 5) return 'just now';
   if (s < 60) return `${s}s ago`;
   const m = Math.floor(s / 60);
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
 }
 
-function clockTime(iso: string): string {
-  if (!iso) return '—';
+function fmtClock(iso: string): string {
   const d = new Date(iso);
-  if (isNaN(d.getTime())) return '—';
+  if (Number.isNaN(d.getTime())) return '—';
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-function uptimeColor(u: number): string {
-  if (u >= 99.9) return 'text-emerald-300';
-  if (u >= 99) return 'text-amber-300';
-  return 'text-rose-300';
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function statusColor(status: ServiceStatus): string {
-  if (status === 'healthy') return '#34d399';
-  if (status === 'degraded') return '#fbbf24';
-  return '#fb7185';
+function fmtNum(n: number, digits = 0): string {
+  return n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
-function severityColor(sev: Severity): string {
-  if (sev === 'critical') return '#fb7185';
-  if (sev === 'warning') return '#fbbf24';
-  return '#22d3ee';
-}
-
-function latencyColor(v: number, threshold: number): string {
-  if (v <= threshold * 0.7) return '#34d399';
-  if (v <= threshold) return '#fbbf24';
-  return '#fb7185';
-}
-
-function genSparkline(base: number, n = 26): number[] {
-  const out: number[] = [];
-  let v = base;
-  for (let i = 0; i < n; i++) {
-    v += (Math.random() - 0.5) * base * 0.45;
-    v = Math.max(base * 0.35, Math.min(base * 1.9, v));
-    out.push(Math.round(v));
-  }
-  return out;
-}
-
-function genMetrics(base: number, n = 48): MetricPoint[] {
-  const now = Date.now();
-  const out: MetricPoint[] = [];
-  let v = base;
-  for (let i = n - 1; i >= 0; i--) {
-    v += (Math.random() - 0.5) * base * 0.4;
-    v = Math.max(base * 0.3, Math.min(base * 2, v));
-    out.push({
-      timestamp: new Date(now - i * 60000).toISOString(),
-      latency: Math.round(v),
-      errorRate: +(Math.random() * 2.4).toFixed(2),
-      cpu: Math.round(18 + Math.random() * 62),
-    });
-  }
-  return out;
-}
-
-function genIncident(service: Service, i: number): Incident {
-  const sev: Severity =
-    service.status === 'down' ? '
+function statusMeta(status: ServiceStatus) {
+  switch (status) {
+    case 'healthy':
+      return { label: 'Healthy', dot: 'bg-emerald-400', text: 'text-emerald-300', ring: 'ring-emerald-500/30', glow: 'shadow-[0_0_12px_rgba(52,211,153,0.5)]' };
+    case 'degraded':
+      return { label: 'Degraded', dot: 'bg-amber-400', text: 'text-amber-300
